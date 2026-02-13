@@ -1,0 +1,66 @@
+<#	
+    .SYNOPSIS
+        Generates a compliance status report for a specific Intune Device Configuration policy.
+    
+    .DESCRIPTION
+        This script connects to Microsoft Graph to fetch the assignment status of a 
+        specific configuration policy. It filters the results by user domain and 
+        exports the data to an Excel report for business review.
+
+    .NOTES
+        Required Modules: Microsoft.Graph.Beta, CsvToExcel
+        Author: Toon Van Londersele
+        Date: 17/04/2025
+#>
+
+# --- CONFIGURATION ---
+$TenantId   = "00000000-0000-0000-0000-000000000000" # Replace with actual Tenant ID
+$PolicyId   = "00000000-0000-0000-0000-000000000000" # Target Policy ID
+$PolicyName = "POLICY NAME HERE"
+$UserFilter = "*@example.com" # Replace with target domain
+
+# Path Setup
+$ReportDir  = "C:\Reports\PolicyCompliance"
+if (-not (Test-Path $ReportDir)) { New-Item -ItemType Directory -Path $ReportDir }
+
+$CsvPath    = "$ReportDir\PolicyReport_$($PolicyName).csv"
+$ExcelPath  = "$ReportDir\PolicyReport_$($PolicyName).xlsx"
+$Delimiter  = ";"
+
+# --- ENVIRONMENT SETUP ---
+# Adding local user module path if necessary
+$CurrentUser = [System.Environment]::UserName
+$CustomModulePath = "C:\Users\$CurrentUser\Documents\WindowsPowerShell\Modules"
+if ($env:PSModulePath -notlike "*$CustomModulePath*") {
+    $env:PSModulePath += ";$CustomModulePath"
+}
+
+# --- PROCESS ---
+Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
+Connect-Graph -TenantId $TenantId -NoWelcome -Scopes "DeviceManagementConfiguration.Read.All", "DeviceManagementManagedDevices.Read.All"
+
+Write-Host "Fetching Compliance Data for Policy: $PolicyName" -ForegroundColor Yellow
+
+# Retrieve device status for the specific configuration policy
+$ComplianceData = Get-MgBetaDeviceManagementDeviceConfigurationDeviceStatus -DeviceConfigurationId $PolicyId -All | 
+    Where-Object { $_.UserPrincipalName -like $UserFilter } | 
+    Select-Object UserName, DeviceDisplayName, LastReportedDateTime
+
+if ($ComplianceData) {
+    # Export to CSV
+    $ComplianceData | Export-Csv -Path $CsvPath -Delimiter $Delimiter -NoTypeInformation -Encoding UTF8
+    
+    # Convert to Excel
+    if (Get-Module -ListAvailable CsvToExcel) {
+        Import-Module CsvToExcel
+        CsvToExcel -FilePath $CsvPath -Destination $ExcelPath
+        Write-Host "Success! Excel report generated at: $ExcelPath" -ForegroundColor Green
+    } else {
+        Write-Warning "CsvToExcel module not found. Data saved to CSV only."
+    }
+} else {
+    Write-Error "No data found for the specified policy and filter."
+}
+
+# Disconnect
+Disconnect-Graph
