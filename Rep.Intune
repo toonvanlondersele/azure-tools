@@ -1,0 +1,124 @@
+<#	
+    .SYNOPSIS
+        Generates a report of managed devices for specific Azure AD group members.
+    
+    .DESCRIPTION
+        This script connects to the Microsoft Graph API to retrieve members of defined 
+        security groups and collects detailed device information (Intune/Managed Devices).
+        The output is exported to CSV and then converted to an Excel report.
+
+    .NOTES
+        Required Modules: Microsoft.Graph.Beta, CsvToExcel
+        Author: Toon Van Londersele
+        Date: 17/04/2025
+#>
+
+# --- CONFIGURATION ---
+$TenantId = "00000000-0000-0000-0000-000000000000" # Replace with actual Tenant ID
+$TargetGroups = @('SG-WIN-USERS-01', 'SG-WIN-USERS-02')
+$DomainFilters = @('example.com', 'example.org')
+$DevicePrefix = "PC-*" # Filter for specific naming conventions
+
+# Path Setup
+$DateStamp = Get-Date -Format ddMMyyyy
+$ExportPath = "C:\Reports"
+if (-not (Test-Path $ExportPath)) { New-Item -ItemType Directory -Path $ExportPath }
+
+$CsvFile = "$ExportPath\DeviceReport_$DateStamp.csv"
+$ExcelFile = "$ExportPath\DeviceReport_$DateStamp.xlsx"
+$Delimiter = ';'
+
+# --- MODULE LOADING ---
+Import-Module Microsoft.Graph.Beta
+if (-not (Get-Module -ListAvailable CsvToExcel)) {
+    Write-Warning "Module CsvToExcel not found. Please install for Excel conversion."
+}
+
+# --- INITIALIZE OUTPUT ---
+$Output = New-Object System.Text.StringBuilder
+$Header = @(
+    'Email', 
+    'DisplayName', 
+    'Hostname', 
+    'SerialNumber', 
+    'Manufacturer', 
+    'Model', 
+    'OSVersion', 
+    'RegistrationDate', 
+    'Compliant', 
+    'EnrollmentType', 
+    'LastSync'
+) -Join $Delimiter
+[void]$Output.AppendLine($Header)
+
+# --- CONNECT TO MICROSOFT GRAPH ---
+Connect-Graph -TenantId $TenantId -NoWelcome -Scopes 'Group.Read.All', 'DeviceManagementManagedDevices.Read.All', 'Directory.Read.All'
+
+# --- DATA PROCESSING ---
+foreach ($GroupName in $TargetGroups) {
+    Write-Host "Processing Group: $GroupName" -ForegroundColor Cyan
+    
+    # Retrieve the group object
+    $Group = Get-MgBetaGroup -Filter "DisplayName eq '$GroupName'" -ConsistencyLevel eventual
+    if (-not $Group) { 
+        Write-Warning "Group '$GroupName' not found. Skipping..."
+        continue 
+    }
+
+    $Params = @{
+        GroupId = $Group.Id
+        Property = "OnPremisesDistinguishedName,Mail"
+        ConsistencyLevel = 'eventual'
+    }
+    
+    # Fetch members and apply domain filtering
+    $Members = Get-MgbetaGroupMemberAsUser -All @Params | Where-Object { 
+        $userMail = $_.Mail; $DomainFilters | Where-Object { $userMail -like "*$_*" } 
+    }
+
+    foreach ($Member in $Members) {
+        # Fetch registered devices for the user matching the prefix
+        $Devices = Get-MgbetaUserRegisteredDevice -UserId $Member.Mail | ForEach-Object {
+            $_.AdditionalProperties["displayName"]
+        } | Where-Object { $_ -like $DevicePrefix }
+
+        foreach ($HostName in $Devices) {
+            # Retrieve detailed hardware info from Azure AD
+            $DeviceDetail = Get-MgBetaDevice -Filter "displayName eq '$HostName'" -Property "Manufacturer,Model,OperatingSystemVersion,RegistrationDateTime,IsCompliant,EnrollmentType" -ConsistencyLevel eventual | Select-Object -First 1
+
+            # Retrieve management/sync info from Intune (Managed Devices)
+            $ManagedDevice = Get-MgBetaDeviceManagementManagedDevice -Filter "deviceName eq '$HostName'" -Property LastSyncDateTime, SerialNumber
+
+            # Assemble data line
+            $Line = @(
+              $Member.Mail
+              ($Member.OnPremisesDistinguishedName -replace '^CN=([^,]+),.*$', '$1')
+              $HostName
+              (if ($ManagedDevice.SerialNumber) { $ManagedDevice.SerialNumber } else { "N/A" })
+              (if ($DeviceDetail.Manufacturer) { $DeviceDetail.Manufacturer } else { "Unknown" })
+              (if ($DeviceDetail.Model) { $DeviceDetail.Model.SubString(0,[Math]::Min(10, $DeviceDetail.Model.Length)) } else { "Unknown" })
+              (if ($DeviceDetail.OperatingSystemVersion) { $DeviceDetail.OperatingSystemVersion } else { "Unknown" })
+              $DeviceDetail.RegistrationDateTime
+              $DeviceDetail.IsCompliant
+              $DeviceDetail.EnrollmentType
+              $ManagedDevice.LastSyncDateTime
+        ) -Join $Delimiter
+
+            [void]$Output.AppendLine($Line)
+        }
+    }
+}
+
+# --- EXPORT & FINALIZATION ---
+$Output.ToString() | Set-Content -Path $CsvFile -Encoding UTF8
+
+if (Get-Module -ListAvailable CsvToExcel) {
+    Import-Module CsvToExcel
+    CsvToExcel -FilePath $CsvFile -Destination $ExcelFile
+    Write-Host "Report successfully generated: $ExcelFile" -ForegroundColor Green
+} else {
+    Write-Host "Report saved as CSV (Excel module missing): $CsvFile" -ForegroundColor Yellow
+}
+
+# Disconnect session
+Disconnect-Graph
